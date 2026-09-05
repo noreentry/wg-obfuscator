@@ -1,6 +1,7 @@
 ﻿#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <netdb.h>
@@ -10,9 +11,11 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include "wg-obfuscator.h"
 #include "config.h"
 #include "obfuscation.h"
+#include "pktstats.h"
 #include "uthash.h"
 #include "masking.h"
 
@@ -29,6 +32,7 @@ static pid_t *child_pids = NULL;
 static int child_pids_count = 0;
 // Set by the SIGHUP handler, the log file is reopened from the main loop
 static volatile sig_atomic_t log_reopen_pending = 0;
+static volatile sig_atomic_t shutdown_requested = 0;
 
 // Hostname re-resolve: the blocking getaddrinfo() runs in a helper thread
 #define RESOLVE_TAG_TARGET (-1)
@@ -52,20 +56,15 @@ static int resolve_bindings_count = 0;
     static int epfd = 0;
 #endif
 
-/**
- * @brief Handles incoming signals for the application.
- *
- * This function is registered as a signal handler and is invoked when the process
- * receives a signal. The specific actions taken depend on the signal received.
- *
- * @param signal The signal number received by the process.
- */
-static void signal_handler(int signal) {
+static void resolve_wake(void);
+
+static void destroy_all_connections(void)
+{
     client_entry_t *current_entry, *tmp;
 
-    // Close all connections and clean up
     if (listen_sock) {
         close(listen_sock);
+        listen_sock = 0;
     }
     HASH_ITER(hh, conn_table, current_entry, tmp) {
         if (current_entry->server_sock) {
@@ -77,12 +76,106 @@ static void signal_handler(int signal) {
 #ifdef USE_EPOLL
     if (epfd) {
         close(epfd);
+        epfd = 0;
     }
 #endif
+}
+
+/**
+ * @brief Handles incoming signals for the application.
+ */
+static void signal_handler(int signal) {
+    if (signal == SIGINT || signal == SIGTERM) {
+        shutdown_requested = 1;
+        resolve_wake();
+        stats_wake();
+        return;
+    }
+
+    stats_shutdown();
+    destroy_all_connections();
     log(LL_INFO, "Stopped.");
-    exit(signal != -1 ? EXIT_SUCCESS : EXIT_FAILURE);
+    exit(EXIT_FAILURE);
 }
 #define FAILURE() signal_handler(-1)
+
+static ssize_t recv_udp_ts(int fd, uint8_t *buffer, size_t buflen,
+                           struct sockaddr_in *addr, socklen_t *addr_len,
+                           uint64_t *t_us_out)
+{
+    *t_us_out = stats_now_us();
+#ifdef SO_TIMESTAMPNS
+    uint8_t cmsgbuf[CMSG_SPACE(sizeof(struct timespec))];
+    struct iovec iov = { .iov_base = buffer, .iov_len = buflen };
+    struct msghdr msg = {0};
+
+    msg.msg_name = addr;
+    msg.msg_namelen = *addr_len;
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT);
+    if (n < 0) {
+        return n;
+    }
+
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
+            struct timespec *ts = (struct timespec *)CMSG_DATA(c);
+            *t_us_out = (uint64_t)ts->tv_sec * 1000000ULL + (uint64_t)ts->tv_nsec / 1000ULL;
+            break;
+        }
+    }
+    return n;
+#else
+    return recvfrom(fd, buffer, buflen, MSG_DONTWAIT, (struct sockaddr *)addr, addr_len);
+#endif
+}
+
+static ssize_t recv_connected_ts(int fd, uint8_t *buffer, size_t buflen, uint64_t *t_us_out)
+{
+    *t_us_out = stats_now_us();
+#ifdef SO_TIMESTAMPNS
+    uint8_t cmsgbuf[CMSG_SPACE(sizeof(struct timespec))];
+    struct iovec iov = { .iov_base = buffer, .iov_len = buflen };
+    struct msghdr msg = {0};
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    ssize_t n = recvmsg(fd, &msg, MSG_DONTWAIT);
+    if (n < 0) {
+        return n;
+    }
+
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c; c = CMSG_NXTHDR(&msg, c)) {
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPNS) {
+            struct timespec *ts = (struct timespec *)CMSG_DATA(c);
+            *t_us_out = (uint64_t)ts->tv_sec * 1000000ULL + (uint64_t)ts->tv_nsec / 1000ULL;
+            break;
+        }
+    }
+    return n;
+#else
+    return recv(fd, buffer, buflen, MSG_DONTWAIT);
+#endif
+}
+
+static void assign_stats_stream(client_entry_t *client_entry)
+{
+    if (!stats_enabled() || !client_entry) {
+        return;
+    }
+    client_entry->stats_stream = stats_alloc_stream();
+    log(LL_INFO, "stats stream %u = %s:%d",
+        client_entry->stats_stream,
+        inet_ntoa(client_entry->client_addr.sin_addr),
+        ntohs(client_entry->client_addr.sin_port));
+}
 
 /**
  * @brief Returns 1 if the string is a dotted IPv4 address, 0 otherwise.
@@ -404,6 +497,7 @@ static void sighup_handler(int sig)
     (void)sig;
     log_reopen_pending = 1;
     resolve_wake();
+    stats_wake();
     // The list is filled before the handler is installed, so it can't change here
     for (int i = 0; i < child_pids_count; i++) {
         kill(child_pids[i], SIGHUP);
@@ -459,6 +553,7 @@ static client_entry_t * new_client_entry(obfuscator_config_t *config, struct soc
 #endif
     // Set the server address to the specified one
     connect(client_entry->server_sock, (struct sockaddr *)forward_addr, sizeof(*forward_addr));
+    stats_enable_timestampns(client_entry->server_sock);
     // Get the assigned port number
     socklen_t our_addr_len = sizeof(client_entry->our_addr);
     if (getsockname(client_entry->server_sock, (struct sockaddr *)&client_entry->our_addr, &our_addr_len) == -1) {
@@ -483,7 +578,9 @@ static client_entry_t * new_client_entry(obfuscator_config_t *config, struct soc
 
     HASH_ADD(hh, conn_table, client_addr, sizeof(*client_addr), client_entry);
 
-    log(LL_DEBUG, "Added binding: %s:%d:%d", 
+    assign_stats_stream(client_entry);
+
+    log(LL_DEBUG, "Added binding: %s:%d:%d",
         inet_ntoa(client_entry->client_addr.sin_addr), ntohs(client_entry->client_addr.sin_port),
         ntohs(client_entry->our_addr.sin_port));
 
@@ -570,6 +667,7 @@ static client_entry_t * new_client_entry_static(obfuscator_config_t *config, str
 #endif
     // Set the server address to the specified one
     connect(client_entry->server_sock, (struct sockaddr *)forward_addr, sizeof(*forward_addr));
+    stats_enable_timestampns(client_entry->server_sock);
 
 #ifdef USE_EPOLL    
     struct epoll_event e = {
@@ -590,6 +688,8 @@ static client_entry_t * new_client_entry_static(obfuscator_config_t *config, str
     }
 
     HASH_ADD(hh, conn_table, client_addr, sizeof(*client_addr), client_entry);
+
+    assign_stats_stream(client_entry);
 
     return client_entry;
 }
@@ -635,7 +735,7 @@ int main(int argc, char *argv[]) {
     struct sockaddr_in 
         listen_addr, // Address for listening socket, for receiving data from the client
         forward_addr; // Address for forwarding socket, for sending data to the server
-    uint8_t full_buffer[BUFFER_SIZE + PREBUFFER_SIZE];
+    uint8_t full_buffer[PREBUFFER_SIZE + BUFFER_SIZE + POSTBUFFER_SIZE];
     char target_host[256] = {0};
     int target_port = -1;
     int key_length = 0;
@@ -657,6 +757,10 @@ int main(int argc, char *argv[]) {
     /* Start writing to the log file before validating the rest of the parameters,
        so that configuration errors are logged there too */
     log_init(config.log_file_set ? config.log_file : NULL, config.log_timestamps);
+
+    if (stats_init(&config, section_name) != 0) {
+        exit(EXIT_FAILURE);
+    }
 
 #ifdef USE_EPOLL
     struct epoll_event events[MAX_EVENTS];
@@ -775,6 +879,8 @@ int main(int argc, char *argv[]) {
         FAILURE();
     }
     log(LL_INFO, "Listening on port %s:%d for source", inet_ntoa(listen_addr.sin_addr), ntohs(listen_addr.sin_port));
+
+    stats_enable_timestampns(listen_sock);
 
     if (config.masking_handler_set) {
         log(LL_INFO, "Using masking type: %s", config.masking_handler ? config.masking_handler->name : "none");
@@ -913,13 +1019,23 @@ int main(int argc, char *argv[]) {
                 FAILURE();
             }
         }
+        if (stats_flip_pipe_fd() >= 0) {
+            struct epoll_event ev = {
+                .events = EPOLLIN,
+                .data.fd = stats_flip_pipe_fd()
+            };
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, stats_flip_pipe_fd(), &ev) != 0) {
+                serror("epoll_ctl for stats flip pipe");
+                FAILURE();
+            }
+        }
 #endif
     }
 
     log(LL_INFO, "WireGuard obfuscator successfully started");
 
     /* Main loop */
-    while (1) {
+    while (!shutdown_requested) {
         // Reopen the log file after it has been rotated, requested by SIGHUP
         if (log_reopen_pending) {
             log_reopen_pending = 0;
@@ -944,6 +1060,11 @@ int main(int argc, char *argv[]) {
         nfds++;
         if (resolve_result_rd >= 0) {
             pollfds[nfds].fd = resolve_result_rd;
+            pollfds[nfds].events = POLLIN;
+            nfds++;
+        }
+        if (stats_flip_pipe_fd() >= 0) {
+            pollfds[nfds].fd = stats_flip_pipe_fd();
             pollfds[nfds].events = POLLIN;
             nfds++;
         }
@@ -980,11 +1101,19 @@ int main(int argc, char *argv[]) {
                 drain_resolve_results(&forward_addr);
                 continue;
             }
+            if (stats_flip_pipe_fd() >= 0 && event->data.fd == stats_flip_pipe_fd()) {
+                stats_on_flip_pipe();
+                continue;
+            }
             if (event->data.fd == listen_sock) {
 #else
         for (int e = 0; e < nfds; e++) if (pollfds[e].revents & POLLIN) {
             if (resolve_result_rd >= 0 && pollfds[e].fd == resolve_result_rd) {
                 drain_resolve_results(&forward_addr);
+                continue;
+            }
+            if (stats_flip_pipe_fd() >= 0 && pollfds[e].fd == stats_flip_pipe_fd()) {
+                stats_on_flip_pipe();
                 continue;
             }
             if (pollfds[e].fd == listen_sock) {
@@ -993,7 +1122,9 @@ int main(int argc, char *argv[]) {
                 uint8_t *buffer = full_buffer + PREBUFFER_SIZE;
                 struct sockaddr_in sender_addr = {0};
                 socklen_t sender_addr_len = sizeof(sender_addr);
-                int length = recvfrom(listen_sock, buffer, BUFFER_SIZE, MSG_TRUNC | MSG_DONTWAIT, (struct sockaddr *)&sender_addr, &sender_addr_len);
+                uint64_t t_recv = 0;
+                int recv_max = stats_trailer_enabled() ? BUFFER_SIZE - STATS_TRAILER_SIZE : BUFFER_SIZE;
+                int length = (int)recv_udp_ts(listen_sock, buffer, BUFFER_SIZE, &sender_addr, &sender_addr_len, &t_recv);
                 if (length < 0) {
                     // A readiness notification does not guarantee that there is something
                     // to read by the time we get here, so an empty socket is not an error
@@ -1002,9 +1133,9 @@ int main(int argc, char *argv[]) {
                     }
                     continue;
                 }
-                if (length > BUFFER_SIZE) {
+                if (length > recv_max) {
                     log(LL_DEBUG, "Received packet from %s:%d is too large (%d bytes), while buffer size is %d bytes, ignoring",
-                        inet_ntoa(sender_addr.sin_addr), ntohs(sender_addr.sin_port), length, BUFFER_SIZE);
+                        inet_ntoa(sender_addr.sin_addr), ntohs(sender_addr.sin_port), length, recv_max);
                     continue;
                 }
 
@@ -1040,6 +1171,15 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (obfuscated) {
+                    uint32_t stats_seq = 0;
+                    uint16_t wire_len = (uint16_t)length;
+                    if (stats_trailer_enabled()) {
+                        if (stats_trailer_strip(buffer, &length, &stats_seq) != 0) {
+                            log(LL_DEBUG, "stats: failed to strip trailer from %s:%d (%d bytes)",
+                                inet_ntoa(sender_addr.sin_addr), ntohs(sender_addr.sin_port), length);
+                            continue;
+                        }
+                    }
                     // decode
                     int original_length = length;
                     length = decode(buffer, length, config.xor_key, key_length, &version);
@@ -1047,6 +1187,10 @@ int main(int argc, char *argv[]) {
                         log(LL_DEBUG, "Failed to decode packet from %s:%d (original_length=%d, decoded_length=%d)",
                             inet_ntoa(sender_addr.sin_addr), ntohs(sender_addr.sin_port), original_length, length);
                         continue;
+                    }
+                    if (stats_trailer_enabled()) {
+                        uint8_t stream = client_entry ? client_entry->stats_stream : 0;
+                        stats_record_recv(stats_seq, t_recv, wire_len, stream, stats_wg_type_flags(buffer));
                     }
                 }
 
@@ -1138,13 +1282,34 @@ int main(int argc, char *argv[]) {
 
                 if (!obfuscated && !client_entry->client_clean) {
                     // If the packet is not obfuscated, we need to encode it
+                    uint32_t stats_seq = UINT32_MAX;
                     length = encode(buffer, length, config.xor_key, key_length, client_entry->version, config.max_dummy_length_data);
                     if (length < 4) {
                         log(LL_ERROR, "Failed to encode packet from %s:%d (too short, length=%d)",
                             inet_ntoa(sender_addr.sin_addr), ntohs(sender_addr.sin_port), length);
                         continue;
                     }
+                    if (stats_trailer_enabled()) {
+                        stats_seq = stats_seq_next();
+                        if (stats_trailer_append(buffer, &length, stats_seq) != 0) {
+                            log(LL_ERROR, "stats: failed to append trailer for %s:%d",
+                                inet_ntoa(sender_addr.sin_addr), ntohs(sender_addr.sin_port));
+                            continue;
+                        }
+                    }
                     length = masking_data_wrap_to_server(&buffer, length, &config, client_entry, listen_sock, &forward_addr);
+                    int send_len = length;
+                    length = send(client_entry->server_sock, buffer, length, 0);
+                    if (stats_seq != UINT32_MAX) {
+                        stats_record_sent(stats_seq, stats_now_us(), (uint16_t)send_len,
+                            client_entry->stats_stream, stats_wg_type_flags(buffer), length < 0);
+                    }
+                    if (length < 0) {
+                        serror_level(LL_DEBUG, "sendto %s:%d", target_host, target_port);
+                        continue;
+                    }
+                    client_entry->last_activity_time = now;
+                    continue;
                 }
 
                 log_hexdump(LL_TRACE, (!obfuscated && !client_entry->client_clean) ? "X->: " : "O->: ", buffer, length);
@@ -1163,16 +1328,18 @@ int main(int argc, char *argv[]) {
                 client_entry_t *client_entry = find_by_server_sock(pollfds[e].fd);
 #endif
                 uint8_t *buffer = full_buffer + PREBUFFER_SIZE;
-                int length = recv(client_entry->server_sock, buffer, BUFFER_SIZE, MSG_TRUNC | MSG_DONTWAIT);
+                uint64_t t_recv = 0;
+                int recv_max = stats_trailer_enabled() ? BUFFER_SIZE - STATS_TRAILER_SIZE : BUFFER_SIZE;
+                int length = (int)recv_connected_ts(client_entry->server_sock, buffer, BUFFER_SIZE, &t_recv);
                 if (length < 0) {
                     if (errno != EAGAIN && errno != EWOULDBLOCK) {
                         serror_level(LL_DEBUG, "recv from server");
                     }
                     continue;
                 }
-                if (length > BUFFER_SIZE) {
+                if (length > recv_max) {
                     log(LL_DEBUG, "Received packet from %s:%d is too large (%d bytes), while buffer size is %d bytes, ignoring",
-                        target_host, target_port, length, BUFFER_SIZE);
+                        target_host, target_port, length, recv_max);
                     continue;
                 }
                 uint8_t obfuscated = length >= 4 && is_obfuscated(buffer);
@@ -1202,12 +1369,25 @@ int main(int argc, char *argv[]) {
                 }
 
                 if (obfuscated) {
+                    uint32_t stats_seq = 0;
+                    uint16_t wire_len = (uint16_t)length;
+                    if (stats_trailer_enabled()) {
+                        if (stats_trailer_strip(buffer, &length, &stats_seq) != 0) {
+                            log(LL_DEBUG, "stats: failed to strip trailer from %s:%d (%d bytes)",
+                                target_host, target_port, length);
+                            continue;
+                        }
+                    }
                     // decode
                     int original_length = length;
                     length = decode(buffer, length, config.xor_key, key_length, &version);
                     if (length < 4 || length > original_length) {
                         log(LL_DEBUG, "Failed to decode packet from %s:%d (original_length=%d, decoded_length=%d)", target_host, target_port, original_length, length);
                         continue;
+                    }
+                    if (stats_trailer_enabled()) {
+                        stats_record_recv(stats_seq, t_recv, wire_len, client_entry->stats_stream,
+                            stats_wg_type_flags(buffer));
                     }
                 }
 
@@ -1274,12 +1454,33 @@ int main(int argc, char *argv[]) {
 
                 if (!obfuscated && !client_entry->client_clean) {
                     // If the packet is not obfuscated, we need to encode it
+                    uint32_t stats_seq = UINT32_MAX;
                     length = encode(buffer, length, config.xor_key, key_length, client_entry->version, config.max_dummy_length_data);
                     if (length < 4) {
                         log(LL_ERROR, "Failed to encode packet from %s:%d", target_host, target_port);
                         continue;
                     }
+                    if (stats_trailer_enabled()) {
+                        stats_seq = stats_seq_next();
+                        if (stats_trailer_append(buffer, &length, stats_seq) != 0) {
+                            log(LL_ERROR, "stats: failed to append trailer for %s:%d", target_host, target_port);
+                            continue;
+                        }
+                    }
                     length = masking_data_wrap_to_client(&buffer, length, &config, client_entry, listen_sock, &forward_addr);
+                    int send_len = length;
+                    length = sendto(listen_sock, buffer, length, 0, (struct sockaddr *)&client_entry->client_addr, sizeof(client_entry->client_addr));
+                    if (stats_seq != UINT32_MAX) {
+                        stats_record_sent(stats_seq, stats_now_us(), (uint16_t)send_len,
+                            client_entry->stats_stream, stats_wg_type_flags(buffer), length < 0);
+                    }
+                    if (length < 0) {
+                        serror_level(LL_DEBUG, "sendto %s:%d", inet_ntoa(client_entry->client_addr.sin_addr), ntohs(client_entry->client_addr.sin_port));
+                        continue;
+                    }
+                    client_entry->last_activity_time = now;
+                    client_entry->last_incoming_time = now;
+                    continue;
                 }
                 
                 log_hexdump(LL_TRACE, (!obfuscated && !client_entry->client_clean) ? "<-X: " : "<-O: ", buffer, length);
@@ -1331,8 +1532,10 @@ int main(int argc, char *argv[]) {
             // Update the last cleanup time
             last_cleanup_time = now;
         }
-    } // while (1)
+    } // while (!shutdown_requested)
 
-    // You should never reach this point, but just in case
+    stats_shutdown();
+    destroy_all_connections();
+    log(LL_INFO, "Stopped.");
     return 0;
 }

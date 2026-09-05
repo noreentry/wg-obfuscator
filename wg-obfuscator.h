@@ -28,6 +28,7 @@
 // TODO: make these configurable via command line arguments or config file
 #define BUFFER_SIZE                     65535   // size of the buffer for receiving data from the clients and server
 #define PREBUFFER_SIZE                  1024    // size of the additional buffer size before the main buffer
+#define POSTBUFFER_SIZE                 16      // tail headroom for the stats trailer after encode()
 #define POLL_TIMEOUT                    5000    // in milliseconds
 #define HANDSHAKE_TIMEOUT               5000    // in milliseconds
 #define ITERATE_INTERVAL                1000    // in milliseconds
@@ -82,6 +83,13 @@ typedef struct {
     char log_file[512];                         // Path of the log file
     int8_t log_timestamps;                      // 1 to force timestamps on, 0 to force them off, -1 for auto
     long resolve_interval;                      // Hostname re-resolve interval in milliseconds, 0 to disable periodic refresh
+    char stats_dir[512];                        // Directory for binary stats dumps
+    char stats_prefix[256];                     // File name prefix for stats dumps
+    int stats_interval_sec;                     // Dump interval in seconds (5 or 10)
+    int stats_max_files;                        // Number of rotating dump files
+    int stats_block_records;                    // Records per in-memory block
+    uint8_t stats_seq_enabled;                  // 1 to append the 4-byte XOR trailer on obfuscated packets
+    uint8_t stats_fsync;                        // 1 to fsync() each dump file before rename
 
     uint8_t log_file_set;                       // 1 if the log file is set, 0 otherwise
     uint8_t listen_port_set;                    // 1 if the listen port is set, 0 otherwise
@@ -90,6 +98,9 @@ typedef struct {
     uint8_t client_interface_set;               // 1 if the client interface is set, 0 otherwise
     uint8_t static_bindings_set;                // 1 if the static bindings are set, 0 otherwise
     uint8_t masking_handler_set;                // 1 if the masking handler is set, 0 otherwise
+    uint8_t stats_dir_set;                      // 1 if stats-dir is set, 0 otherwise
+    uint8_t stats_prefix_set;                   // 1 if stats-prefix is set, 0 otherwise
+    uint8_t stats_seq_set;                      // 1 if stats-seq was set explicitly, 0 otherwise
 } obfuscator_config_t;
 
 // Structure to hold client connection information
@@ -111,6 +122,7 @@ typedef struct {
     uint8_t client_clean        : 1;            // 1 if the client speaks plain (non-obfuscated) WireGuard, traffic is passed through as is (allow-clean mode)
     uint8_t is_static           : 1;            // 1 if this is a static binding entry, 0 otherwise
     char bind_host[256];                        // Original hostname of a static binding, empty if the address is a literal or the entry is dynamic
+    uint8_t stats_stream;                       // Stream id for stats records (per client_entry)
     UT_hash_handle hh;
 } client_entry_t;
 

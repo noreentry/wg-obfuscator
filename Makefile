@@ -1,7 +1,7 @@
 PROG_NAME    = wg-obfuscator
 CONFIG       = wg-obfuscator.conf
 SERVICE_FILE = wg-obfuscator.service
-HEADERS      = wg-obfuscator.h obfuscation.h config.h uthash.h mini_argp.h masking.h masking_stun.h
+HEADERS      = wg-obfuscator.h obfuscation.h config.h uthash.h mini_argp.h masking.h masking_stun.h pktstats.h
 
 RELEASE ?= 0
 
@@ -14,7 +14,7 @@ else
   CFLAGS   = -O2 -Wall
   LDFLAGS += -s
 endif
-OBJS = wg-obfuscator.o config.o masking.o masking_stun.o obfuscation.o logging.o
+OBJS = wg-obfuscator.o config.o masking.o masking_stun.o obfuscation.o logging.o pktstats.o
 EXEDIR = .
 
 CFLAGS  += -pthread
