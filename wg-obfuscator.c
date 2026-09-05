@@ -1283,6 +1283,7 @@ int main(int argc, char *argv[]) {
                 if (!obfuscated && !client_entry->client_clean) {
                     // If the packet is not obfuscated, we need to encode it
                     uint32_t stats_seq = UINT32_MAX;
+                    uint8_t wg_type_flags = stats_wg_type_flags(buffer);
                     length = encode(buffer, length, config.xor_key, key_length, client_entry->version, config.max_dummy_length_data);
                     if (length < 4) {
                         log(LL_ERROR, "Failed to encode packet from %s:%d (too short, length=%d)",
@@ -1302,7 +1303,7 @@ int main(int argc, char *argv[]) {
                     length = send(client_entry->server_sock, buffer, length, 0);
                     if (stats_seq != UINT32_MAX) {
                         stats_record_sent(stats_seq, stats_now_us(), (uint16_t)send_len,
-                            client_entry->stats_stream, stats_wg_type_flags(buffer), length < 0);
+                            client_entry->stats_stream, wg_type_flags, length < 0);
                     }
                     if (length < 0) {
                         serror_level(LL_DEBUG, "sendto %s:%d", target_host, target_port);
@@ -1455,6 +1456,7 @@ int main(int argc, char *argv[]) {
                 if (!obfuscated && !client_entry->client_clean) {
                     // If the packet is not obfuscated, we need to encode it
                     uint32_t stats_seq = UINT32_MAX;
+                    uint8_t wg_type_flags = stats_wg_type_flags(buffer);
                     length = encode(buffer, length, config.xor_key, key_length, client_entry->version, config.max_dummy_length_data);
                     if (length < 4) {
                         log(LL_ERROR, "Failed to encode packet from %s:%d", target_host, target_port);
@@ -1472,7 +1474,7 @@ int main(int argc, char *argv[]) {
                     length = sendto(listen_sock, buffer, length, 0, (struct sockaddr *)&client_entry->client_addr, sizeof(client_entry->client_addr));
                     if (stats_seq != UINT32_MAX) {
                         stats_record_sent(stats_seq, stats_now_us(), (uint16_t)send_len,
-                            client_entry->stats_stream, stats_wg_type_flags(buffer), length < 0);
+                            client_entry->stats_stream, wg_type_flags, length < 0);
                     }
                     if (length < 0) {
                         serror_level(LL_DEBUG, "sendto %s:%d", inet_ntoa(client_entry->client_addr.sin_addr), ntohs(client_entry->client_addr.sin_port));
