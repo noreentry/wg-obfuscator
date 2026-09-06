@@ -53,7 +53,6 @@ int stats_enabled(void);
 int stats_trailer_enabled(void);
 
 int stats_init_settings(const stats_settings_t *settings, const char *section);
-/* wg-obfuscator only; declared in wg-obfuscator.h via obfuscator_config_t */
 void stats_shutdown(void);
 
 void stats_wake(void);

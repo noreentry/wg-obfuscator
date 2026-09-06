@@ -28,7 +28,7 @@
 // TODO: make these configurable via command line arguments or config file
 #define BUFFER_SIZE                     65535   // size of the buffer for receiving data from the clients and server
 #define PREBUFFER_SIZE                  1024    // size of the additional buffer size before the main buffer
-#define POSTBUFFER_SIZE                 16      // tail headroom for the stats trailer after encode()
+#define POSTBUFFER_SIZE                 4       // tail headroom after encode()
 #define POLL_TIMEOUT                    5000    // in milliseconds
 #define HANDSHAKE_TIMEOUT               5000    // in milliseconds
 #define ITERATE_INTERVAL                1000    // in milliseconds

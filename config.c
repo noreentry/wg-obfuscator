@@ -33,13 +33,6 @@ static const mini_argp_opt options[] = {
     { "log-file", 'L', 1 },
     { "log-timestamps", 'T', 1 },
     { "resolve-interval", 'R', 1 },
-    { "stats-dir", 'G', 1 },
-    { "stats-prefix", 'H', 1 },
-    { "stats-interval", 'J', 1 },
-    { "stats-max-files", 'Q', 1 },
-    { "stats-block-records", 'U', 1 },
-    { "stats-seq", 'W', 1 },
-    { "stats-fsync", 'Z', 0 },
     { 0 }
 };
 
@@ -92,17 +85,7 @@ static void show_usage(void)
         "                             every N seconds (default: 0 - disabled).\n"
         "                             SIGHUP always triggers a refresh.\n"
         "                             If non-zero, a failed resolve at startup is retried\n"
-        "                             instead of exiting.\n"
-        "\n"
-        "Packet stats (optional):\n"
-        "  -G, --stats-dir=<path>     Directory for binary packet stats dumps\n"
-        "  -H, --stats-prefix=<name>  Dump file prefix (default: section name)\n"
-        "  -J, --stats-interval=<sec> Dump interval in seconds (default: 5)\n"
-        "  -Q, --stats-max-files=<n>  Rotating dump files (default: 1000)\n"
-        "  -U, --stats-block-records=<n> Records per in-memory block (default: 1000000)\n"
-        "  -W, --stats-seq=<bool>     Append 4-byte XOR trailer on obfuscated packets\n"
-        "                             (default: true when --stats-dir is set)\n"
-        "  -Z, --stats-fsync          fsync() each dump file before rename\n");
+        "                             instead of exiting.\n");
 }
 
 static int parse_opt(const char *lname, char sname, const char *val, void *ctx);
@@ -126,10 +109,6 @@ static void reset_config(obfuscator_config_t *config)
     config->in_timeout = IN_TIMEOUT_DEFAULT;
     config->max_dummy_length_data = MAX_DUMMY_LENGTH_DATA_DEFAULT;
     config->log_timestamps = -1; // auto
-    config->stats_interval_sec = 5;
-    config->stats_max_files = 1000;
-    config->stats_block_records = 1000000;
-    config->stats_seq_enabled = 1;
     verbose = LL_DEFAULT;
 }
 
@@ -509,74 +488,6 @@ static int parse_opt(const char *lname, char sname, const char *val, void *ctx)
                 exit(EXIT_FAILURE);
             }
             config->resolve_interval *= 1000; // Convert to milliseconds
-            break;
-        case 'G':
-            strncpy(config->stats_dir, val, sizeof(config->stats_dir) - 1);
-            config->stats_dir[sizeof(config->stats_dir) - 1] = 0;
-            if (strlen(config->stats_dir) == 0) {
-                log(LL_ERROR, "Stats directory path cannot be empty");
-                exit(EXIT_FAILURE);
-            }
-            config->stats_dir_set = 1;
-            if (!config->stats_seq_set) {
-                config->stats_seq_enabled = 1;
-            }
-            break;
-        case 'H':
-            strncpy(config->stats_prefix, val, sizeof(config->stats_prefix) - 1);
-            config->stats_prefix[sizeof(config->stats_prefix) - 1] = 0;
-            if (strlen(config->stats_prefix) == 0) {
-                log(LL_ERROR, "Stats prefix cannot be empty");
-                exit(EXIT_FAILURE);
-            }
-            config->stats_prefix_set = 1;
-            break;
-        case 'J':
-            if (!is_integer(val)) {
-                log(LL_ERROR, "Invalid stats interval: %s (must be an integer)", val);
-                exit(EXIT_FAILURE);
-            }
-            config->stats_interval_sec = atoi(val);
-            if (config->stats_interval_sec <= 0 || 60 % config->stats_interval_sec != 0) {
-                log(LL_ERROR, "Invalid stats interval: %s (must divide 60 evenly)", val);
-                exit(EXIT_FAILURE);
-            }
-            break;
-        case 'Q':
-            if (!is_integer(val)) {
-                log(LL_ERROR, "Invalid stats max files: %s (must be an integer)", val);
-                exit(EXIT_FAILURE);
-            }
-            config->stats_max_files = atoi(val);
-            if (config->stats_max_files <= 0 || config->stats_max_files > 1000000) {
-                log(LL_ERROR, "Invalid stats max files: %s", val);
-                exit(EXIT_FAILURE);
-            }
-            break;
-        case 'U':
-            if (!is_integer(val)) {
-                log(LL_ERROR, "Invalid stats block records: %s (must be an integer)", val);
-                exit(EXIT_FAILURE);
-            }
-            config->stats_block_records = atoi(val);
-            if (config->stats_block_records <= 0) {
-                log(LL_ERROR, "Invalid stats block records: %s", val);
-                exit(EXIT_FAILURE);
-            }
-            break;
-        case 'W':
-            {
-                int b = parse_bool(val);
-                if (b < 0) {
-                    log(LL_ERROR, "Invalid stats-seq value: %s", val);
-                    exit(EXIT_FAILURE);
-                }
-                config->stats_seq_enabled = (uint8_t)b;
-                config->stats_seq_set = 1;
-            }
-            break;
-        case 'Z':
-            config->stats_fsync = 1;
             break;
         default:
             // should never happen

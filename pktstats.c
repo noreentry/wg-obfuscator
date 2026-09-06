@@ -495,24 +495,6 @@ int stats_init_settings(const stats_settings_t *settings, const char *section)
     return 0;
 }
 
-int stats_init(const obfuscator_config_t *config, const char *section)
-{
-    if (!config || !config->stats_dir_set) {
-        return 0;
-    }
-
-    stats_settings_t settings = {
-        .stats_dir = config->stats_dir,
-        .stats_prefix = config->stats_prefix_set ? config->stats_prefix : NULL,
-        .stats_interval_sec = config->stats_interval_sec,
-        .stats_max_files = config->stats_max_files,
-        .stats_block_records = config->stats_block_records,
-        .stats_seq_enabled = config->stats_seq_enabled,
-        .stats_fsync = config->stats_fsync,
-    };
-    return stats_init_settings(&settings, section);
-}
-
 void stats_shutdown(void)
 {
     if (!stats_active) {
