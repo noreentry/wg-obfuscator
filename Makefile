@@ -2,6 +2,7 @@ PROG_NAME    = wg-obfuscator
 CONFIG       = wg-obfuscator.conf
 SERVICE_FILE = wg-obfuscator.service
 HEADERS      = wg-obfuscator.h obfuscation.h config.h uthash.h mini_argp.h masking.h masking_stun.h pktstats.h
+TUNNEL_HEADERS = udp-pktunnel.h wg-obfuscator.h uthash.h mini_argp.h pktstats.h
 
 RELEASE ?= 0
 
@@ -15,6 +16,7 @@ else
   LDFLAGS += -s
 endif
 OBJS = wg-obfuscator.o config.o masking.o masking_stun.o obfuscation.o logging.o pktstats.o
+TUNNEL_OBJS = udp-pktunnel.o udp-pktunnel-config.o logging.o pktstats.o
 EXEDIR = .
 
 CFLAGS  += -pthread
@@ -24,8 +26,10 @@ EXTRA_CFLAGS =
 
 ifeq ($(OS),Windows_NT)
   TARGET = $(EXEDIR)/$(PROG_NAME).exe
+  TUNNEL_TARGET = $(EXEDIR)/udp-pktunnel.exe
 else
   TARGET = $(EXEDIR)/$(PROG_NAME)
+  TUNNEL_TARGET = $(EXEDIR)/udp-pktunnel
 endif
 
 # build on macos(arm) support
@@ -57,7 +61,7 @@ else
   endif
 endif
 
-all: $(TARGET)
+all: $(TARGET) $(TUNNEL_TARGET)
 
 # Force to RELEASE if ".git" directory is not present
 ifeq ($(RELEASE),0)
@@ -91,18 +95,28 @@ clean:
 	$(RM) *.o
 ifeq ($(OS),Windows_NT)
 	@if [ -f "$(TARGET)" ]; then for f in `cygcheck "$(TARGET)" | grep .dll | grep msys` ; do rm -f $(EXEDIR)/`basename "$$f"` ; done fi
+	@if [ -f "$(TUNNEL_TARGET)" ]; then for f in `cygcheck "$(TUNNEL_TARGET)" | grep .dll | grep msys` ; do rm -f $(EXEDIR)/`basename "$$f"` ; done fi
 endif
-	$(RM) $(TARGET)
+	$(RM) $(TARGET) $(TUNNEL_TARGET)
 
 $(OBJS): 
 
 %.o : %.c $(HEADERS)
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ -c $<
 
+udp-pktunnel.o udp-pktunnel-config.o: %.o : %.c $(TUNNEL_HEADERS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ -c $<
+
 $(TARGET): $(OBJS)
 	$(CC) -o $(TARGET) $(OBJS) $(LDFLAGS)
 ifeq ($(OS),Windows_NT)
 	@for f in `cygcheck "$(TARGET)" | grep .dll | grep msys` ; do if [ ! -f "$(EXEDIR)/`basename $$f`" ] ; then cp -vf `cygpath "$$f"` $(EXEDIR)/ ; fi ; done
+endif
+
+$(TUNNEL_TARGET): $(TUNNEL_OBJS)
+	$(CC) -o $(TUNNEL_TARGET) $(TUNNEL_OBJS) $(LDFLAGS)
+ifeq ($(OS),Windows_NT)
+	@for f in `cygcheck "$(TUNNEL_TARGET)" | grep .dll | grep msys` ; do if [ ! -f "$(EXEDIR)/`basename $$f`" ] ; then cp -vf `cygpath "$$f"` $(EXEDIR)/ ; fi ; done
 endif
 
 install: $(TARGET)

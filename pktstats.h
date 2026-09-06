@@ -2,12 +2,12 @@
 #define _PKTSTATS_H_
 
 #include <stdint.h>
-#include "wg-obfuscator.h"
 
 #define STATS_TRAILER_SIZE      4
 #define STATS_RECORD_SIZE       16
 #define STATS_FILE_HDR_SIZE     64
 #define STATS_MAGIC             0x315453424F4757ULL  /* "WGOBST1\0" little-endian */
+#define STATS_PACKET_MAX        65535
 
 typedef struct __attribute__((packed)) {
     uint64_t t_us;
@@ -39,10 +39,21 @@ _Static_assert(sizeof(stats_file_hdr_t) == STATS_FILE_HDR_SIZE, "stats_file_hdr_
 #define STATS_FLAG_SENT   0x01
 #define STATS_FLAG_ERROR  0x02
 
+typedef struct {
+    const char *stats_dir;
+    const char *stats_prefix;       /* NULL → section name or "stats" */
+    int stats_interval_sec;         /* 0 → 5 */
+    int stats_max_files;            /* 0 → 1000 */
+    int stats_block_records;        /* 0 → 1000000 */
+    uint8_t stats_seq_enabled;
+    uint8_t stats_fsync;
+} stats_settings_t;
+
 int stats_enabled(void);
 int stats_trailer_enabled(void);
 
-int stats_init(const obfuscator_config_t *config, const char *section);
+int stats_init_settings(const stats_settings_t *settings, const char *section);
+/* wg-obfuscator only; declared in wg-obfuscator.h via obfuscator_config_t */
 void stats_shutdown(void);
 
 void stats_wake(void);

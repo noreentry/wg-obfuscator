@@ -15,7 +15,6 @@
 
 #include "wg-obfuscator.h"
 #include "pktstats.h"
-#include "obfuscation.h"
 
 #define STATS_BLOCK_COUNT       3
 #define STATS_VERSION           1
@@ -78,10 +77,8 @@ uint64_t stats_now_us(void)
 
 uint8_t stats_wg_type_flags(const uint8_t *buffer)
 {
-    if (!buffer) {
-        return 0;
-    }
-    return (uint8_t)(WG_TYPE(buffer) & 0x03u);
+    (void)buffer;
+    return 0;
 }
 
 int stats_enabled(void)
@@ -124,7 +121,7 @@ static uint32_t le32_get(const uint8_t *p)
 int stats_trailer_append(uint8_t *buffer, int *length, uint32_t seq)
 {
     int len = *length;
-    if (!stats_trailer_on || len < 4 || len + STATS_TRAILER_SIZE > BUFFER_SIZE) {
+    if (!stats_trailer_on || len < 4 || len + STATS_TRAILER_SIZE > STATS_PACKET_MAX) {
         return -1;
     }
     uint32_t mask = le32_get(buffer + len - 4);
@@ -411,26 +408,26 @@ int stats_enable_timestampns(int fd)
 #endif
 }
 
-int stats_init(const obfuscator_config_t *config, const char *section)
+int stats_init_settings(const stats_settings_t *settings, const char *section)
 {
-    if (!config || !config->stats_dir_set) {
+    if (!settings || !settings->stats_dir || !settings->stats_dir[0]) {
         return 0;
     }
 
-    strncpy(stats_dir, config->stats_dir, sizeof(stats_dir) - 1);
-    if (config->stats_prefix_set) {
-        strncpy(stats_prefix, config->stats_prefix, sizeof(stats_prefix) - 1);
+    strncpy(stats_dir, settings->stats_dir, sizeof(stats_dir) - 1);
+    if (settings->stats_prefix && settings->stats_prefix[0]) {
+        strncpy(stats_prefix, settings->stats_prefix, sizeof(stats_prefix) - 1);
     } else if (section && *section) {
         strncpy(stats_prefix, section, sizeof(stats_prefix) - 1);
     } else {
         strncpy(stats_prefix, "stats", sizeof(stats_prefix) - 1);
     }
 
-    stats_interval_sec = config->stats_interval_sec > 0 ? config->stats_interval_sec : 5;
-    stats_max_files = config->stats_max_files > 0 ? config->stats_max_files : 1000;
-    stats_block_cap = config->stats_block_records > 0 ? (uint32_t)config->stats_block_records : 1000000u;
-    stats_fsync = config->stats_fsync;
-    stats_trailer_on = config->stats_seq_enabled;
+    stats_interval_sec = settings->stats_interval_sec > 0 ? settings->stats_interval_sec : 5;
+    stats_max_files = settings->stats_max_files > 0 ? settings->stats_max_files : 1000;
+    stats_block_cap = settings->stats_block_records > 0 ? (uint32_t)settings->stats_block_records : 1000000u;
+    stats_fsync = settings->stats_fsync;
+    stats_trailer_on = settings->stats_seq_enabled;
     stats_run_id_us = realtime_us();
     strncpy(stats_section, section ? section : "main", sizeof(stats_section) - 1);
 
@@ -496,6 +493,24 @@ int stats_init(const obfuscator_config_t *config, const char *section)
         stats_dir, stats_prefix, stats_interval_sec,
         stats_trailer_on ? "yes" : "no", stats_block_cap);
     return 0;
+}
+
+int stats_init(const obfuscator_config_t *config, const char *section)
+{
+    if (!config || !config->stats_dir_set) {
+        return 0;
+    }
+
+    stats_settings_t settings = {
+        .stats_dir = config->stats_dir,
+        .stats_prefix = config->stats_prefix_set ? config->stats_prefix : NULL,
+        .stats_interval_sec = config->stats_interval_sec,
+        .stats_max_files = config->stats_max_files,
+        .stats_block_records = config->stats_block_records,
+        .stats_seq_enabled = config->stats_seq_enabled,
+        .stats_fsync = config->stats_fsync,
+    };
+    return stats_init_settings(&settings, section);
 }
 
 void stats_shutdown(void)

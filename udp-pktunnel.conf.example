@@ -1,0 +1,12 @@
+# Example: siteagw inbound — forward to local iperf3
+# Public: homegw/MTA DNAT UDP 20004 → siteagw:20004
+
+[main]
+source-lport = 20004
+target = 127.0.0.1:5201
+stats-dir = /home/noreentry/prjs/wg-obfuscator/stats-tunnel
+stats-interval = 5
+stats-seq = true
+verbose = INFO
+log-file = /home/noreentry/prjs/wg-obfuscator/logs/udp-pktunnel.log
+log-timestamps = true

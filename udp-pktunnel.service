@@ -1,0 +1,16 @@
+[Unit]
+Description=UDP pktunnel (plain relay + pktstats)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/udp-pktunnel -c /etc/udp-pktunnel.conf
+ExecReload=/bin/kill -HUP $MAINPID
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

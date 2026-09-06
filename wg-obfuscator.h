@@ -144,4 +144,6 @@ void log_printf(int level, const char *fmt, ...);
 #endif
 void log_hexdump(int level, const char *prefix, const uint8_t *data, int length);
 
+int stats_init(const obfuscator_config_t *config, const char *section);
+
 #endif
