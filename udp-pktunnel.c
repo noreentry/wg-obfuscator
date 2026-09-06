@@ -22,6 +22,9 @@
 #include "udp-pktunnel.h"
 #include "pktstats.h"
 
+#define TUNNEL_POLL_TIMEOUT_MS   1000
+#define TUNNEL_PRUNE_INTERVAL_MS 1000
+
 int verbose = LL_INFO;
 char section_name[256] = "main";
 
@@ -300,6 +303,15 @@ static tunnel_client_t *new_client(const struct sockaddr_in *client_addr)
     return entry;
 }
 
+static void forward_to_wan(tunnel_client_t *entry, uint8_t *buffer, int length,
+                           uint64_t t_recv, int wire_len);
+static void forward_to_peer(tunnel_client_t *entry, uint8_t *buffer, int length,
+                            uint64_t t_recv, int wire_len);
+static void handle_client_ingress(tunnel_client_t *entry, uint8_t *buffer, int length,
+                                  uint64_t t_recv, int wire_len);
+static void handle_listen_ingress(const struct sockaddr_in *client_addr,
+                                  uint8_t *buffer, int length, uint64_t t_recv);
+
 static void prune_idle_clients(void)
 {
     if (idle_timeout_ms <= 0) {
@@ -312,6 +324,74 @@ static void prune_idle_clients(void)
             log(LL_INFO, "removing idle client %s:%d",
                 inet_ntoa(entry->client_addr.sin_addr), ntohs(entry->client_addr.sin_port));
             destroy_client(entry);
+        }
+    }
+}
+
+static tunnel_client_t *find_client_by_peer_sock(int peer_sock)
+{
+    tunnel_client_t *entry, *tmp;
+    HASH_ITER(hh, clients, entry, tmp) {
+        if (entry->peer_sock == peer_sock) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+/* Drain obfmod/WAN replies on peer_sock. Returns 1 if entry was destroyed. */
+static int drain_peer_sock(tunnel_client_t *entry, uint8_t *buffer)
+{
+    if (!entry || entry->peer_sock < 0) {
+        return 0;
+    }
+
+    for (;;) {
+        uint64_t t_recv;
+        ssize_t n = recv_connected_ts(entry->peer_sock, buffer, STATS_PACKET_MAX, &t_recv);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            log(LL_DEBUG, "peer recv error for %s:%d",
+                inet_ntoa(entry->client_addr.sin_addr), ntohs(entry->client_addr.sin_port));
+            destroy_client(entry);
+            return 1;
+        }
+        if (n == 0) {
+            destroy_client(entry);
+            return 1;
+        }
+        traffic_note_rx(n);
+        handle_client_ingress(entry, buffer, (int)n, t_recv, (int)n);
+    }
+    return 0;
+}
+
+static void drain_listen_sock(uint8_t *buffer)
+{
+    for (;;) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        uint64_t t_recv;
+        ssize_t n = recv_udp_ts(listen_sock, buffer, STATS_PACKET_MAX,
+                                &client_addr, &client_len, &t_recv);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                break;
+            }
+            serror("recvfrom listen");
+            break;
+        }
+        if (n == 0) {
+            break;
+        }
+        traffic_note_rx(n);
+        handle_listen_ingress(&client_addr, buffer, (int)n, t_recv);
+        /* obfmod is a separate process: reply may land before peer_sock is polled. */
+        tunnel_client_t *entry = find_client(&client_addr);
+        if (entry) {
+            drain_peer_sock(entry, buffer);
         }
     }
 }
@@ -522,18 +602,50 @@ int tunnel_run(const tunnel_config_t *config)
 
     int stats_fd = stats_flip_pipe_fd();
     uint8_t buffer[STATS_PACKET_MAX + TUNNEL_POSTBUFFER_SIZE];
-    struct pollfd pfds[2];
-    int npoll = 1;
-    pfds[0].fd = listen_sock;
-    pfds[0].events = POLLIN;
-    if (stats_fd >= 0) {
-        pfds[1].fd = stats_fd;
-        pfds[1].events = POLLIN;
-        npoll = 2;
+    int poll_cap = max_clients + 2;
+    struct pollfd *pfds = calloc((size_t)poll_cap, sizeof(*pfds));
+    if (!pfds) {
+        log(LL_ERROR, "calloc pollfd failed");
+        stats_shutdown();
+        close(listen_sock);
+        listen_sock = -1;
+        return -1;
     }
 
+    long last_prune_ms = now_ms();
+
     while (!shutdown_req) {
-        int pr = poll(pfds, (nfds_t)npoll, 1000);
+        int nfds = 0;
+
+        pfds[nfds].fd = listen_sock;
+        pfds[nfds].events = POLLIN;
+        pfds[nfds].revents = 0;
+        nfds++;
+
+        if (stats_fd >= 0) {
+            if (nfds >= poll_cap) {
+                log(LL_WARN, "pollfd array full, stats pipe not monitored");
+            } else {
+                pfds[nfds].fd = stats_fd;
+                pfds[nfds].events = POLLIN;
+                pfds[nfds].revents = 0;
+                nfds++;
+            }
+        }
+
+        tunnel_client_t *entry, *tmp;
+        HASH_ITER(hh, clients, entry, tmp) {
+            if (nfds >= poll_cap) {
+                log(LL_WARN, "pollfd array full, skipping extra clients");
+                break;
+            }
+            pfds[nfds].fd = entry->peer_sock;
+            pfds[nfds].events = POLLIN;
+            pfds[nfds].revents = 0;
+            nfds++;
+        }
+
+        int pr = poll(pfds, (nfds_t)nfds, TUNNEL_POLL_TIMEOUT_MS);
         if (pr < 0) {
             if (errno == EINTR) {
                 continue;
@@ -542,61 +654,53 @@ int tunnel_run(const tunnel_config_t *config)
             break;
         }
 
-        if (pr == 0) {
+        long now = now_ms();
+        if (now - last_prune_ms >= TUNNEL_PRUNE_INTERVAL_MS) {
             prune_idle_clients();
+            last_prune_ms = now;
         }
 
         traffic_maybe_report();
 
-        if (pfds[0].revents & POLLIN) {
-            for (;;) {
-                struct sockaddr_in client_addr;
-                socklen_t client_len = sizeof(client_addr);
-                uint64_t t_recv;
-                ssize_t n = recv_udp_ts(listen_sock, buffer, STATS_PACKET_MAX,
-                                        &client_addr, &client_len, &t_recv);
-                if (n < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        break;
-                    }
-                    serror("recvfrom listen");
-                    break;
-                }
-                if (n == 0) {
-                    break;
-                }
-                traffic_note_rx(n);
-                handle_listen_ingress(&client_addr, buffer, (int)n, t_recv);
+        for (int i = 0; i < nfds; i++) {
+            short rev = pfds[i].revents;
+            if (rev == 0) {
+                continue;
             }
-        }
-
-        if (npoll > 1 && (pfds[1].revents & POLLIN)) {
-            stats_on_flip_pipe();
-        }
-
-        tunnel_client_t *entry, *tmp;
-        HASH_ITER(hh, clients, entry, tmp) {
-            for (;;) {
-                uint64_t t_recv;
-                ssize_t n = recv_connected_ts(entry->peer_sock, buffer, STATS_PACKET_MAX, &t_recv);
-                if (n < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        break;
+            if (rev & (POLLERR | POLLHUP | POLLNVAL)) {
+                if (pfds[i].fd != listen_sock && pfds[i].fd != stats_fd) {
+                    tunnel_client_t *bad = find_client_by_peer_sock(pfds[i].fd);
+                    if (bad) {
+                        log(LL_DEBUG, "poll error on peer %s:%d",
+                            inet_ntoa(bad->client_addr.sin_addr),
+                            ntohs(bad->client_addr.sin_port));
+                        destroy_client(bad);
                     }
-                    log(LL_DEBUG, "peer recv error for %s:%d",
-                        inet_ntoa(entry->client_addr.sin_addr), ntohs(entry->client_addr.sin_port));
-                    destroy_client(entry);
-                    break;
                 }
-                if (n == 0) {
-                    destroy_client(entry);
-                    break;
-                }
-                traffic_note_rx(n);
-                handle_client_ingress(entry, buffer, (int)n, t_recv, (int)n);
+                continue;
             }
+            if (!(rev & POLLIN)) {
+                continue;
+            }
+
+            if (pfds[i].fd == listen_sock) {
+                drain_listen_sock(buffer);
+                continue;
+            }
+            if (stats_fd >= 0 && pfds[i].fd == stats_fd) {
+                stats_on_flip_pipe();
+                continue;
+            }
+
+            tunnel_client_t *peer = find_client_by_peer_sock(pfds[i].fd);
+            if (!peer) {
+                continue;
+            }
+            drain_peer_sock(peer, buffer);
         }
     }
+
+    free(pfds);
 
     destroy_all_clients();
     if (listen_sock >= 0) {

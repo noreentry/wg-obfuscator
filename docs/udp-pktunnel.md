@@ -45,6 +45,17 @@ Counts and rates are for the completed 5-second interval. Idle intervals report
 `0 pkts 0.00 Mbit/s`. View with `journalctl -u … -f` or when running in the
 foreground.
 
+## Event loop (listen + peer sockets)
+
+The relay sits between a local app (e.g. obfmod on `127.0.0.1:21003`) and the
+WAN listen port. Each WAN client gets a connected `peer_sock` to the target.
+**Both** `listen_sock` and every `peer_sock` are in the `poll()` set so return
+traffic from obfmod is not delayed by the 1 s poll timeout.
+
+After each packet on `listen_sock`, the tunnel also drains the matching
+`peer_sock` immediately (obfmod is a separate process; replies can land before
+the next poll).
+
 ## Example: oraa → siteagw (between wg-obfuscators)
 
 Repo configs: `nrn-infra/hosts/oraa/services/udp-pktunnel/` and
