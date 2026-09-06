@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <netdb.h>
 #include <poll.h>
 #include <signal.h>
@@ -31,6 +32,67 @@ static struct sockaddr_in forward_addr;
 static long idle_timeout_ms = TUNNEL_IDLE_MS_DEFAULT;
 static int max_clients = TUNNEL_MAX_CLIENTS_DEF;
 static tunnel_role_t tunnel_role = TUNNEL_ROLE_CLIENT;
+
+typedef struct {
+    uint64_t rx_pkts;
+    uint64_t rx_bytes;
+    uint64_t tx_pkts;
+    uint64_t tx_bytes;
+} traffic_bucket_t;
+
+static traffic_bucket_t traffic_cur;
+static time_t traffic_slot = -1;
+
+static void traffic_note_rx(ssize_t nbytes)
+{
+    if (nbytes <= 0) {
+        return;
+    }
+    traffic_cur.rx_pkts++;
+    traffic_cur.rx_bytes += (uint64_t)nbytes;
+}
+
+static void traffic_note_tx(ssize_t nbytes)
+{
+    if (nbytes <= 0) {
+        return;
+    }
+    traffic_cur.tx_pkts++;
+    traffic_cur.tx_bytes += (uint64_t)nbytes;
+}
+
+static void traffic_log_interval(time_t slot_end)
+{
+    double sec = (double)TUNNEL_TRAFFIC_LOG_SEC;
+    double tx_mbps = (traffic_cur.tx_bytes * 8.0) / (sec * 1000000.0);
+    double rx_mbps = (traffic_cur.rx_bytes * 8.0) / (sec * 1000000.0);
+
+    fprintf(stderr,
+            "[%ld] tunnel %s: sent %" PRIu64 " pkts %.2f Mbit/s  recv %" PRIu64 " pkts %.2f Mbit/s\n",
+            (long)slot_end, section_name,
+            traffic_cur.tx_pkts, tx_mbps,
+            traffic_cur.rx_pkts, rx_mbps);
+    fflush(stderr);
+
+    memset(&traffic_cur, 0, sizeof(traffic_cur));
+}
+
+static void traffic_maybe_report(void)
+{
+    time_t now = time(NULL);
+    if (now < 0) {
+        return;
+    }
+    time_t slot = now / TUNNEL_TRAFFIC_LOG_SEC;
+    if (traffic_slot < 0) {
+        traffic_slot = slot;
+        return;
+    }
+    while (traffic_slot < slot) {
+        traffic_slot++;
+        traffic_log_interval(traffic_slot * TUNNEL_TRAFFIC_LOG_SEC);
+    }
+}
 
 const char *version_string(void)
 {
@@ -277,6 +339,8 @@ static void forward_to_wan(tunnel_client_t *entry, uint8_t *buffer, int length,
     if (sent < 0) {
         serror("sendto client");
         send_err = 1;
+    } else {
+        traffic_note_tx(sent);
     }
 
     if (stats_trailer_enabled() && entry->stats_active) {
@@ -307,6 +371,8 @@ static void forward_to_peer(tunnel_client_t *entry, uint8_t *buffer, int length,
     if (sent < 0) {
         serror("send to target");
         send_err = 1;
+    } else {
+        traffic_note_tx(sent);
     }
 
     if (stats_trailer_enabled()) {
@@ -340,6 +406,8 @@ static void handle_client_ingress(tunnel_client_t *entry, uint8_t *buffer, int l
                           (struct sockaddr *)&entry->client_addr, sizeof(entry->client_addr));
     if (sent < 0) {
         serror("sendto client");
+    } else {
+        traffic_note_tx(sent);
     }
     entry->last_activity_ms = now_ms();
 }
@@ -373,6 +441,8 @@ static void handle_listen_ingress(const struct sockaddr_in *client_addr,
         ssize_t sent = send(entry->peer_sock, buffer, (size_t)payload_len, 0);
         if (sent < 0) {
             serror("send to target");
+        } else {
+            traffic_note_tx(sent);
         }
         entry->last_activity_ms = now_ms();
         return;
@@ -476,6 +546,8 @@ int tunnel_run(const tunnel_config_t *config)
             prune_idle_clients();
         }
 
+        traffic_maybe_report();
+
         if (pfds[0].revents & POLLIN) {
             for (;;) {
                 struct sockaddr_in client_addr;
@@ -493,6 +565,7 @@ int tunnel_run(const tunnel_config_t *config)
                 if (n == 0) {
                     break;
                 }
+                traffic_note_rx(n);
                 handle_listen_ingress(&client_addr, buffer, (int)n, t_recv);
             }
         }
@@ -519,6 +592,7 @@ int tunnel_run(const tunnel_config_t *config)
                     destroy_client(entry);
                     break;
                 }
+                traffic_note_rx(n);
                 handle_client_ingress(entry, buffer, (int)n, t_recv, (int)n);
             }
         }

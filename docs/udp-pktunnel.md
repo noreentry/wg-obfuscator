@@ -32,6 +32,19 @@ log-timestamps = true
 | `stats-seq` | Append/strip 4-byte seq trailer on the tunnel leg |
 | `role` | `client` (oraa) or `server` (siteagw WAN inbound) — flips trailer append/strip |
 
+## Console traffic summary (stderr)
+
+Every **5 seconds** on wall-clock boundaries (`…:00`, `…:05`, `…:10`, …) the
+process prints one line to **stderr** (always, even when `log-file` is set):
+
+```
+[1757157005] tunnel main: sent 1234 pkts 9.87 Mbit/s  recv 1200 pkts 9.50 Mbit/s
+```
+
+Counts and rates are for the completed 5-second interval. Idle intervals report
+`0 pkts 0.00 Mbit/s`. View with `journalctl -u … -f` or when running in the
+foreground.
+
 ## Example: oraa → siteagw (between wg-obfuscators)
 
 Repo configs: `nrn-infra/hosts/oraa/services/udp-pktunnel/` and
